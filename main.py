@@ -1,48 +1,66 @@
-import asyncio, os, smtplib
-from pyppeteer import launch
+# main.py
+import os, asyncio, smtplib
 from email.mime.text import MIMEText
+from datetime import datetime as dt
+from pathlib import Path
+
+from pyppeteer import launch
 from PIL import Image, ImageChops
 
-URL = "https://gb.hyrox.com/checkout/hyrox-london-excel-season-25-26-rzstou"
-LAST_IMG = "last.png"
-CURR_IMG = "curr.png"
+# ── CONFIG ───────────────────────────────────────────
+URL        = "https://gb.hyrox.com/checkout/hyrox-london-excel-season-25-26-rzstou"
+WIDTH      = 1280
+HEIGHT     = 1024
+BASE_IMG   = Path("last.png")
+CURR_IMG   = Path("curr.png")
 
-EMAIL_FROM = os.getenv("EMAIL_FROM")
-EMAIL_PASS = os.getenv("EMAIL_PASS")
-EMAIL_TO = os.getenv("EMAIL_TO")
+EMAIL_FROM = os.getenv("EMAIL_FROM")  # your gmail address
+EMAIL_PASS = os.getenv("EMAIL_PASS")  # 16-char Gmail *app* password
+EMAIL_TO   = os.getenv("EMAIL_TO")    # where alerts go
+# ─────────────────────────────────────────────────────
 
-async def take_screenshot(path):
+def log(msg: str) -> None:
+    print(f"[{dt.utcnow():%Y-%m-%d %H:%M:%S}] {msg}", flush=True)
+
+async def screenshot(path: Path):
     browser = await launch(headless=True, args=["--no-sandbox"])
     page = await browser.newPage()
-    await page.setViewport({'width': 1280, 'height': 1024})
+    await page.setViewport({'width': WIDTH, 'height': HEIGHT})
     await page.goto(URL, {'waitUntil': 'networkidle2'})
-    await page.screenshot({'path': path})
+    await page.screenshot({'path': str(path)})
     await browser.close()
+
+def images_differ(a: Path, b: Path) -> bool:
+    if not a.exists():
+        return True
+    diff = ImageChops.difference(Image.open(a), Image.open(b))
+    return diff.getbbox() is not None
 
 def send_email():
     msg = MIMEText("HYROX page visually changed.")
-    msg["Subject"] = "🔔 HYROX Page Change Detected"
+    msg["Subject"] = "🔔 HYROX page changed"
     msg["From"] = EMAIL_FROM
-    msg["To"] = EMAIL_TO
+    msg["To"]   = EMAIL_TO
 
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-        server.login(EMAIL_FROM, EMAIL_PASS)
-        server.send_message(msg)
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
+        s.login(EMAIL_FROM, EMAIL_PASS)
+        s.send_message(msg)
 
-def compare_images(img1_path, img2_path):
-    if not os.path.exists(img1_path):
-        return True
-    img1 = Image.open(img1_path)
-    img2 = Image.open(img2_path)
-    diff = ImageChops.difference(img1, img2)
-    return diff.getbbox() is not None
+async def main():
+    log("===== Job start =====")
+    await screenshot(CURR_IMG)
+    log("📸 Screenshot taken")
 
-async def run():
-    await take_screenshot(CURR_IMG)
-    if compare_images(LAST_IMG, CURR_IMG):
+    if images_differ(BASE_IMG, CURR_IMG):
+        log("🔍 Change detected – e-mailing")
         send_email()
-        os.replace(CURR_IMG, LAST_IMG)
+        CURR_IMG.replace(BASE_IMG)  # overwrite baseline
+        log("📬 Email sent")
     else:
-        os.remove(CURR_IMG)
+        log("✅ No change")
+        CURR_IMG.unlink()  # discard identical shot
 
-asyncio.get_event_loop().run_until_complete(run())
+    log("===== Job finished =====")
+
+if __name__ == "__main__":
+    asyncio.run(main())
