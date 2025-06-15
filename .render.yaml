@@ -1,3 +1,7 @@
+build:
+  environment:
+    pythonVersion: 3.10
+
 services:
   - type: cron
     name: hyrox-monitor
