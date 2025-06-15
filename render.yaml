@@ -13,5 +13,12 @@ services:
         value: angfrslhpwzyfwqx
       - key: EMAIL_TO
         value: oray.gungor@gmail.com
+      - key: GH_TOKEN          # GitHub personal-access-token (gist scope)
+        sync: false
+      - key: GIST_ID           # the hex ID of your private gist
+        sync: false
     buildCommand: pip install -r requirements.txt
     startCommand: python main.py
+
+
+
