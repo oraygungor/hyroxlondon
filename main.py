@@ -9,17 +9,17 @@ EMAIL_FROM = os.environ["EMAIL_FROM"]
 EMAIL_PASS = os.environ["EMAIL_PASS"]
 EMAIL_TO   = os.environ["EMAIL_TO"]
 
-GIST_ID  = os.environ["GIST_ID"]      # secret gist id (hex)
-GH_TOKEN = os.environ["GH_TOKEN"]     # PAT with “gist” scope
+GIST_ID  = os.environ["GIST_ID"]
+GH_TOKEN = os.environ["GH_TOKEN"]
 HEADERS  = {
     "Authorization": f"token {GH_TOKEN}",
     "Accept": "application/vnd.github+json",
 }
 
-def log(msg: str) -> None:
-    print(f"[{dt.utcnow():%H:%M:%S}] {msg}", flush=True)
+def log(m):  # simple timestamped logger
+    print(f"[{dt.utcnow():%H:%M:%S}] {m}", flush=True)
 
-# ── Gist helpers ────────────────────────────────────
+# ---------- GitHub-Gist helpers ----------
 def load_baseline() -> set[str]:
     r = requests.get(f"https://api.github.com/gists/{GIST_ID}",
                      headers=HEADERS, timeout=15)
@@ -31,16 +31,18 @@ def save_baseline(lines: set[str]) -> None:
     payload = {"files": {"hyrox-baseline.txt": {"content": "\n".join(lines) + "\n"}}}
     requests.patch(f"https://api.github.com/gists/{GIST_ID}",
                    headers=HEADERS, json=payload, timeout=15).raise_for_status()
-# ────────────────────────────────────────────────────
+# -----------------------------------------
 
 async def fetch_visible_categories() -> set[str]:
-    """Return ticket-type names that are visible in the checkout iframe."""
-    browser = await launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+    """Return ticket-type names actually visible in the checkout widget."""
+    browser = await launch(headless=True,
+                           args=["--no-sandbox", "--disable-dev-shm-usage"])
     page = await browser.newPage()
     await page.goto(URL, {"waitUntil": "networkidle2"})
 
+    # try up to 40 s for the iframe to appear
     frame = None
-    for _ in range(8):                          # retry up to 40 s total
+    for _ in range(8):
         frames = [f for f in page.frames if "checkout" in f.url]
         if frames:
             frame = frames[0]
@@ -48,15 +50,18 @@ async def fetch_visible_categories() -> set[str]:
         await asyncio.sleep(5)
 
     if not frame:
-        log("⚠️  Checkout iframe not found – skipping run")
+        log("⚠️  checkout iframe not found – skipping run")
         await browser.close()
         return set()
 
-    cats = await frame.evaluate("""
-      [...document.querySelectorAll('[data-ticket-type-name]')]
-        .filter(el => el.offsetWidth && el.offsetHeight)
-        .map(el => el.getAttribute('data-ticket-type-name').trim())
-    """)
+    # IIFE avoids “expression does not evaluate to a function” error
+    cats = await frame.evaluate(
+        """(() => [...document.querySelectorAll('[data-ticket-type-name]')]
+                 .filter(el => el.offsetWidth && el.offsetHeight)
+                 .map(el   => el.getAttribute('data-ticket-type-name').trim())
+        )()"""
+    )
+
     await browser.close()
     return set(cats)
 
@@ -73,8 +78,7 @@ async def main() -> None:
     log("Job start")
     current = await fetch_visible_categories()
     if not current:
-        log("No categories found – ending run")
-        return
+        return  # nothing visible or iframe missing
 
     log("Visible: " + ", ".join(sorted(current)))
     baseline = load_baseline()
@@ -90,6 +94,7 @@ async def main() -> None:
         save_baseline(current)
     else:
         log("✅ No new categories")
+
     log("Job finished")
 
 if __name__ == "__main__":
