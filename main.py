@@ -9,17 +9,17 @@ EMAIL_FROM = os.environ["EMAIL_FROM"]
 EMAIL_PASS = os.environ["EMAIL_PASS"]
 EMAIL_TO   = os.environ["EMAIL_TO"]
 
-GIST_ID  = os.environ["GIST_ID"]
-GH_TOKEN = os.environ["GH_TOKEN"]
+GIST_ID  = os.environ["GIST_ID"]      # secret gist id (hex)
+GH_TOKEN = os.environ["GH_TOKEN"]     # PAT with “gist” scope
 HEADERS  = {
     "Authorization": f"token {GH_TOKEN}",
     "Accept": "application/vnd.github+json",
 }
 
-def log(m):  # quick timestamped logger
-    print(f"[{dt.utcnow():%H:%M:%S}] {m}", flush=True)
+def log(msg: str) -> None:
+    print(f"[{dt.utcnow():%H:%M:%S}] {msg}", flush=True)
 
-# ---------- GitHub-Gist helpers ----------
+# ── Gist helpers ────────────────────────────────────
 def load_baseline() -> set[str]:
     r = requests.get(f"https://api.github.com/gists/{GIST_ID}",
                      headers=HEADERS, timeout=15)
@@ -27,18 +27,30 @@ def load_baseline() -> set[str]:
     txt = next(iter(r.json()["files"].values()))["content"]
     return set(ln.strip() for ln in txt.splitlines() if ln.strip())
 
-def save_baseline(lines: set[str]):
+def save_baseline(lines: set[str]) -> None:
     payload = {"files": {"hyrox-baseline.txt": {"content": "\n".join(lines) + "\n"}}}
     requests.patch(f"https://api.github.com/gists/{GIST_ID}",
                    headers=HEADERS, json=payload, timeout=15).raise_for_status()
-# -----------------------------------------
+# ────────────────────────────────────────────────────
 
 async def fetch_visible_categories() -> set[str]:
-    browser = await launch(headless=True, args=["--no-sandbox"])
+    """Return ticket-type names that are visible in the checkout iframe."""
+    browser = await launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
     page = await browser.newPage()
     await page.goto(URL, {"waitUntil": "networkidle2"})
-    await page.waitForSelector("iframe[src*='secure.checkout']", {"timeout": 15000})
-    frame = next(f for f in page.frames if "secure.checkout" in f.url)
+
+    frame = None
+    for _ in range(8):                          # retry up to 40 s total
+        frames = [f for f in page.frames if "checkout" in f.url]
+        if frames:
+            frame = frames[0]
+            break
+        await asyncio.sleep(5)
+
+    if not frame:
+        log("⚠️  Checkout iframe not found – skipping run")
+        await browser.close()
+        return set()
 
     cats = await frame.evaluate("""
       [...document.querySelectorAll('[data-ticket-type-name]')]
@@ -48,7 +60,7 @@ async def fetch_visible_categories() -> set[str]:
     await browser.close()
     return set(cats)
 
-def send_email(new_cats: set[str]):
+def send_email(new_cats: set[str]) -> None:
     body = "New ticket categories detected:\n\n" + "\n".join(sorted(new_cats))
     msg = MIMEText(body)
     msg["Subject"] = "🔔 HYROX – new ticket category added"
@@ -57,11 +69,14 @@ def send_email(new_cats: set[str]):
         s.login(EMAIL_FROM, EMAIL_PASS)
         s.send_message(msg)
 
-async def main():
+async def main() -> None:
     log("Job start")
     current = await fetch_visible_categories()
-    log("Now visible: " + (", ".join(sorted(current)) or "[none]"))
+    if not current:
+        log("No categories found – ending run")
+        return
 
+    log("Visible: " + ", ".join(sorted(current)))
     baseline = load_baseline()
     if not baseline:
         save_baseline(current)
@@ -70,12 +85,11 @@ async def main():
 
     added = current - baseline
     if added:
-        log("New categories → emailing & updating baseline")
+        log("New categories detected – emailing & updating baseline")
         send_email(added)
         save_baseline(current)
     else:
         log("✅ No new categories")
-
     log("Job finished")
 
 if __name__ == "__main__":
