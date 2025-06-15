@@ -1,0 +1,13 @@
+services:
+  - type: cron
+    name: hyrox-monitor
+    schedule: "@hourly"
+    envVars:
+      - key: EMAIL_FROM
+        value: oray.gungor@gmail.com
+      - key: EMAIL_PASS
+        value: angf rslh pwzy fwqx
+      - key: EMAIL_TO
+        value: oray.gungor@gmail.com
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
