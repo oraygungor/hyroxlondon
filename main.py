@@ -1,101 +1,125 @@
-import os, asyncio, smtplib, requests
-from email.mime.text import MIMEText
-from datetime import datetime as dt
-from pyppeteer import launch
+import requests
+import json
+import os
+import smtplib
+import ssl
+from email.message import EmailMessage
+from bs4 import BeautifulSoup
 
+# --- Configuration ---
 URL = "https://gb.hyrox.com/checkout/hyrox-london-excel-season-25-26-rzstou"
+STATE_FILE = "last_active_tickets.json"
 
-EMAIL_FROM = os.environ["EMAIL_FROM"]
-EMAIL_PASS = os.environ["EMAIL_PASS"]
-EMAIL_TO   = os.environ["EMAIL_TO"]
+# --- Securely load email credentials from Environment Variables ---
+SENDER_EMAIL = os.environ.get('SENDER_EMAIL')
+SENDER_PASSWORD = os.environ.get('SENDER_PASSWORD') # Use an "App Password" for Gmail
+RECIPIENT_EMAIL = os.environ.get('RECIPIENT_EMAIL')
 
-GIST_ID  = os.environ["GIST_ID"]
-GH_TOKEN = os.environ["GH_TOKEN"]
-HEADERS  = {
-    "Authorization": f"token {GH_TOKEN}",
-    "Accept": "application/vnd.github+json",
-}
 
-def log(m):  # simple timestamped logger
-    print(f"[{dt.utcnow():%H:%M:%S}] {m}", flush=True)
+def get_current_active_tickets():
+    """Fetches the current list of active ticket names from the URL."""
+    print("Fetching current ticket status from HYROX page...")
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+        response = requests.get(URL, headers=headers)
+        response.raise_for_status()
 
-# ---------- GitHub-Gist helpers ----------
-def load_baseline() -> set[str]:
-    r = requests.get(f"https://api.github.com/gists/{GIST_ID}",
-                     headers=HEADERS, timeout=15)
-    r.raise_for_status()
-    txt = next(iter(r.json()["files"].values()))["content"]
-    return set(ln.strip() for ln in txt.splitlines() if ln.strip())
+        soup = BeautifulSoup(response.text, 'html.parser')
+        script_tag = soup.find('script', id='__NEXT_DATA__')
+        if not script_tag:
+            return None # Indicate an error
 
-def save_baseline(lines: set[str]) -> None:
-    payload = {"files": {"hyrox-baseline.txt": {"content": "\n".join(lines) + "\n"}}}
-    requests.patch(f"https://api.github.com/gists/{GIST_ID}",
-                   headers=HEADERS, json=payload, timeout=15).raise_for_status()
-# -----------------------------------------
+        data = json.loads(script_tag.string)
+        all_tickets = data['props']['pageProps']['event']['tickets']
 
-async def fetch_visible_categories() -> set[str]:
-    """Return ticket-type names actually visible in the checkout widget."""
-    browser = await launch(headless=True,
-                           args=["--no-sandbox", "--disable-dev-shm-usage"])
-    page = await browser.newPage()
-    await page.goto(URL, {"waitUntil": "networkidle2"})
+        active_ticket_names = set()
+        for ticket in all_tickets:
+            # Filter out hidden "helper" tickets and only consider active ones
+            is_hidden = ticket.get('styleOptions', {}).get('hiddenInSelectionArea', False)
+            is_active = ticket.get('active', False)
+            if is_active and not is_hidden:
+                active_ticket_names.add(ticket.get('name'))
+        
+        print(f"Found {len(active_ticket_names)} active ticket categories.")
+        return active_ticket_names
 
-    # try up to 40 s for the iframe to appear
-    frame = None
-    for _ in range(8):
-        frames = [f for f in page.frames if "checkout" in f.url]
-        if frames:
-            frame = frames[0]
-            break
-        await asyncio.sleep(5)
+    except requests.exceptions.RequestException as e:
+        print(f"Error fetching the URL: {e}")
+        return None
+    except (KeyError, TypeError):
+        print("Error parsing page data. The website structure may have changed.")
+        return None
 
-    if not frame:
-        log("⚠️  checkout iframe not found – skipping run")
-        await browser.close()
+def get_previous_active_tickets():
+    """Reads the set of active tickets from the last successful run."""
+    try:
+        with open(STATE_FILE, 'r') as f:
+            return set(json.load(f))
+    except (FileNotFoundError, json.JSONDecodeError):
+        # If the file doesn't exist or is empty, return an empty set
         return set()
 
-    # IIFE avoids “expression does not evaluate to a function” error
-    cats = await frame.evaluate(
-        """(() => [...document.querySelectorAll('[data-ticket-type-name]')]
-                 .filter(el => el.offsetWidth && el.offsetHeight)
-                 .map(el   => el.getAttribute('data-ticket-type-name').trim())
-        )()"""
-    )
+def save_current_tickets(ticket_names):
+    """Saves the current set of active tickets to the state file."""
+    with open(STATE_FILE, 'w') as f:
+        json.dump(list(ticket_names), f, indent=2)
+    print(f"Updated state file '{STATE_FILE}' with current active tickets.")
 
-    await browser.close()
-    return set(cats)
-
-def send_email(new_cats: set[str]) -> None:
-    body = "New ticket categories detected:\n\n" + "\n".join(sorted(new_cats))
-    msg = MIMEText(body)
-    msg["Subject"] = "🔔 HYROX – new ticket category added"
-    msg["From"], msg["To"] = EMAIL_FROM, EMAIL_TO
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
-        s.login(EMAIL_FROM, EMAIL_PASS)
-        s.send_message(msg)
-
-async def main() -> None:
-    log("Job start")
-    current = await fetch_visible_categories()
-    if not current:
-        return  # nothing visible or iframe missing
-
-    log("Visible: " + ", ".join(sorted(current)))
-    baseline = load_baseline()
-    if not baseline:
-        save_baseline(current)
-        log("Baseline created – no alert")
+def send_notification_email(new_tickets):
+    """Sends an email notification about newly available tickets."""
+    if not all([SENDER_EMAIL, SENDER_PASSWORD, RECIPIENT_EMAIL]):
+        print("Email credentials not set in environment variables. Cannot send email.")
         return
 
-    added = current - baseline
-    if added:
-        log("New categories detected – emailing & updating baseline")
-        send_email(added)
-        save_baseline(current)
-    else:
-        log("✅ No new categories")
+    subject = "New HYROX Tickets Available!"
+    body_list = [
+        "A new HYROX race category has become active!",
+        "\nNewly Detected Tickets:",
+        "-----------------------"
+    ]
+    body_list.extend(f"- {ticket}" for ticket in new_tickets)
+    body_list.append(f"\nCheck the site now: {URL}")
+    body = "\n".join(body_list)
 
-    log("Job finished")
+    msg = EmailMessage()
+    msg.set_content(body)
+    msg['Subject'] = subject
+    msg['From'] = SENDER_EMAIL
+    msg['To'] = RECIPIENT_EMAIL
+
+    print(f"Sending email notification to {RECIPIENT_EMAIL}...")
+    try:
+        # Using SSL for a secure connection to the SMTP server
+        context = ssl.create_default_context()
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=context) as server:
+            server.login(SENDER_EMAIL, SENDER_PASSWORD)
+            server.send_message(msg)
+        print("Email sent successfully!")
+    except Exception as e:
+        print(f"Failed to send email: {e}")
+
+def main():
+    """Main function to run the monitoring logic."""
+    current_tickets = get_current_active_tickets()
+    if current_tickets is None:
+        print("Could not retrieve current tickets. Exiting.")
+        return
+
+    previous_tickets = get_previous_active_tickets()
+    
+    # Use set difference to find what's new
+    newly_active_tickets = current_tickets - previous_tickets
+
+    if newly_active_tickets:
+        print(f"!!! New tickets found: {newly_active_tickets} !!!")
+        send_notification_email(newly_active_tickets)
+    else:
+        print("No new active tickets found. All is quiet.")
+    
+    # Always update the state file with the latest list for the next run
+    save_current_tickets(current_tickets)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
