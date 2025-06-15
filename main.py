@@ -1,4 +1,4 @@
-```python
+
 # main.py  – text-only monitor that looks **inside the HYROX checkout iframe**
 # Baseline is stored in a private GitHub Gist.
 
